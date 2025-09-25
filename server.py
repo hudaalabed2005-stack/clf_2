@@ -13,7 +13,7 @@ from pydantic import BaseModel
 ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY", "")
 PROJECT = "fresh-or-rotten-detection-1yxeg"
 VERSION = "1"
-CLASSIFY_URL = f"https://classify.roboflow.com/{PROJECT}/{VERSION}"
+CLASSIFY_URL = f"{PROJECT}/{VERSION}"
 
 if not ROBOFLOW_API_KEY:
     raise RuntimeError("Missing ROBOFLOW_API_KEY environment variable.")
@@ -198,7 +198,7 @@ def gas(g: GasReading):
     Accept gas info from ESP32/UNO (or the manual UI),
     compute Rs/ratio/ppm, update LAST, and persist to DB.
     """
-    VREF = float(g.vref or3.3)
+    VREF = float(g.vref or 3.3)
     RL   = float(g.rl or 10000.0)
 
     # If only ADC is provided, compute VRL from it.
