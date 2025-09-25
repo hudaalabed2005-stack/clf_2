@@ -9,16 +9,100 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-# roboflow
-ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY", "")
-PROJECT = "fresh-or-rotten-detection-1yxeg"
-VERSION = "1"
-CLASSIFY_URL = f"{PROJECT}/{VERSION}"
+# --- Optional local Image Classifier (PyTorch) as fallback ---
+import torch
+import torch.nn as nn
+from PIL import Image
+from io import BytesIO
+from torchvision import transforms as T
+import numpy as np
 
-if not ROBOFLOW_API_KEY:
-    raise RuntimeError("Missing ROBOFLOW_API_KEY environment variable.")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# FastAPI app + CORS 
+# ====== NEW: Roboflow (hosted) model details ======
+RF_HOST    = os.getenv("RF_HOST", "https://detect.roboflow.com").rstrip("/")
+RF_API_KEY = os.getenv("ROBOFLOW_API_KEY", "").strip()
+RF_PROJECT = os.getenv("RF_PROJECT", "fresh-or-rotten-detection-1yxeg").strip()
+RF_VERSION = os.getenv("RF_VERSION", "1").strip()
+RF_URL     = f"{RF_HOST}/{RF_PROJECT}/{RF_VERSION}"
+
+# ====== (Optional) Local model settings (fallback only) ======
+MODEL_PATH = os.getenv("MODEL_PATH", "spoilage_model.pth")
+CLASS_NAMES = os.getenv("CLASS_NAMES", "fresh,spoiled").split(",")
+IMG_SIZE = int(os.getenv("IMG_SIZE", "224"))
+ARCH = os.getenv("ARCH", "").strip()  # "efficientnet_b0", "mobilenet_v2", etc.
+
+IMG_TX = T.Compose([
+    T.Resize(IMG_SIZE, antialias=True),
+    T.CenterCrop(IMG_SIZE),
+    T.ToTensor(),
+    T.ConvertImageDtype(torch.float32),
+    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+_model = None
+
+def _rebuild_arch_from_env(num_classes: int):
+    if ARCH.lower() == "efficientnet_b0":
+        from torchvision.models import efficientnet_b0
+        m = efficientnet_b0(weights=None)
+        in_feats = m.classifier[1].in_features
+        m.classifier[1] = nn.Linear(in_feats, num_classes)
+        return m
+    if ARCH.lower() == "mobilenet_v2":
+        from torchvision.models import mobilenet_v2
+        m = mobilenet_v2(weights=None)
+        in_feats = m.classifier[1].in_features
+        m.classifier[1] = nn.Linear(in_feats, num_classes)
+        return m
+    raise RuntimeError(
+        "ARCH not recognized and the checkpoint looks like a state_dict. "
+        "Set ARCH env to one of: efficientnet_b0, mobilenet_v2"
+    )
+
+def load_local_model():
+    global _model
+    if _model is not None:
+        return _model
+    # TorchScript
+    try:
+        _model = torch.jit.load(MODEL_PATH, map_location=DEVICE)
+        _model.eval().to(DEVICE)
+        return _model
+    except Exception:
+        pass
+    # Eager or state_dict
+    try:
+        obj = torch.load(MODEL_PATH, map_location=DEVICE)
+        if isinstance(obj, nn.Module):
+            _model = obj.eval().to(DEVICE)
+            return _model
+        state_dict = obj
+        m = _rebuild_arch_from_env(num_classes=len(CLASS_NAMES))
+        m.load_state_dict(state_dict, strict=True)
+        _model = m.eval().to(DEVICE)
+        return _model
+    except Exception as e:
+        raise RuntimeError(f"Failed to load model from {MODEL_PATH}: {e}")
+
+def _predict_pil_local(img: Image.Image):
+    model = load_local_model()
+    x = IMG_TX(img).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        logits = model(x)
+    if logits.ndim == 2 and logits.shape[1] == 1:
+        p_spoiled = torch.sigmoid(logits)[0, 0].item()
+        probs = [1.0 - p_spoiled, p_spoiled]
+    else:
+        probs_t = torch.softmax(logits, dim=1)[0]
+        probs = [p.item() for p in probs_t.tolist()]
+    idx = int(np.argmax(probs))
+    label = CLASS_NAMES[idx].strip()
+    conf = float(probs[idx] * 100.0)
+    raw = {CLASS_NAMES[i].strip(): float(p) for i, p in enumerate(probs)}
+    return {"label": label, "confidence": round(conf, 1), "raw": {"probs": raw}}
+
+# ---------- FastAPI app + CORS ----------
 app = FastAPI(title="Fruit & Gas Cloud API")
 
 app.add_middleware(
@@ -29,7 +113,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# tiny in-memory cache
+# ---------- tiny in-memory cache ----------
 LAST = {
     "vision": None,
     "vision_updated": None,
@@ -37,7 +121,7 @@ LAST = {
     "gas_updated": None,
 }
 
-# SQLite for gas history
+# ---------- SQLite (gas history) ----------
 DB_PATH = Path("data.db")
 
 def init_db():
@@ -46,7 +130,7 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS gas_readings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,         -- ISO UTC string
+            ts TEXT NOT NULL,
             co2 REAL, nh3 REAL, benzene REAL, alcohol REAL
         )
     """)
@@ -55,6 +139,8 @@ def init_db():
     con.close()
 
 def save_reading(ppm: dict):
+    if not ppm:
+        return
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
@@ -85,22 +171,14 @@ def load_history_last_days(days: int = 2):
 
 init_db()
 
-#Prediction helpers
+# ---------- Classification helpers ----------
 def extract_top_class(resp_obj):
-    """
-    Robustly extract the top class+confidence from Roboflow classification responses.
-    Supports both:
-      1) {"predictions":[{"class":"rotten_apple","confidence":0.91}, ...]}
-      2) {"predictions":{"rotten_apple":0.91,"fresh_apple":0.09}}
-    Returns: {"label": str, "confidence": float} or None
-    """
+    """Normalize Roboflow classification JSON to {'label','confidence'}."""
     if not resp_obj:
         return None
     preds = resp_obj.get("predictions")
     if preds is None:
         return None
-
-    # Case A: list of dicts
     if isinstance(preds, list):
         preds_sorted = sorted(preds, key=lambda p: p.get("confidence", 0.0), reverse=True)
         if preds_sorted:
@@ -109,80 +187,59 @@ def extract_top_class(resp_obj):
                 "confidence": round(float(preds_sorted[0].get("confidence", 0.0)) * 100, 1)
             }
         return None
-
-    # Case B: dict mapping class -> confidence
     if isinstance(preds, dict):
         items = sorted(preds.items(), key=lambda kv: kv[1], reverse=True)
         if items:
             c, conf = items[0]
             return {"label": str(c), "confidence": round(float(conf) * 100, 1)}
-
     return None
 
-# ---------- /predict (Classification) ----------
+# ---------- /predict (Hosted model first, then local fallback) ----------
 @app.post("/predict")
 async def predict(image: UploadFile = File(...)):
     """
-    Accept an uploaded image, call Roboflow Classification,
-    cache the raw response, return normalized JSON or a helpful error.
+    Upload image -> call Roboflow hosted model fresh-or-rotten-detection-1yxeg/1.
+    Falls back to local Torch model if RF_API_KEY is missing or request fails.
     """
-    data = await image.read()
     try:
-        # Prefer Authorization header (more reliable than ?api_key=...)
-        headers = {
-            "Authorization": f"Bearer {ROBOFLOW_API_KEY}",
-            "Accept": "application/json"
-        }
-        files = {"file": ("image.jpg", data, image.content_type or "image/jpeg")}
+        data = await image.read()
+        pil = Image.open(BytesIO(data)).convert("RGB")
+    except Exception:
+        return JSONResponse({"error": "invalid_image", "detail": "Could not read image"}, status_code=400)
 
-        resp = requests.post(CLASSIFY_URL, headers=headers, files=files, timeout=60)
+    # 1) Try Roboflow hosted classification
+    if RF_API_KEY:
+        try:
+            url = f"{RF_URL}?api_key={RF_API_KEY}"
+            # Roboflow expects multipart form; 'file' field works for both detect/classify
+            files = {"file": (image.filename or "upload.jpg", data, "application/octet-stream")}
+            rf_resp = requests.post(url, files=files, timeout=30)
+            rf_json = rf_resp.json() if rf_resp.ok else {"error": rf_resp.text}
+            top = extract_top_class(rf_json)
+            if top:
+                out = {"label": top["label"], "confidence": top["confidence"], "raw": rf_json}
+                LAST["vision"] = {"predictions": out}
+                LAST["vision_updated"] = datetime.utcnow().isoformat()
+                return JSONResponse(out)
+        except Exception as e:
+            # fall through to local
+            pass
 
-        # Try to extract Roboflow error message if possible
-        if resp.status_code == 403:
-            return JSONResponse(
-                {
-                    "error": "roboflow_403",
-                    "detail": "Roboflow classification forbidden (403).",
-                    "hints": [
-                        "Check ROBOFLOW_API_KEY (regenerate if necessary).",
-                        "Confirm the model path: "
-                        f"{'WORKSPACE/' if WORKSPACE else ''}{PROJECT}/{VERSION}",
-                        "Make sure the model is deployed for Hosted API.",
-                        "Ensure your key has Hosted API permissions and quota."
-                    ],
-                    "endpoint": CLASSIFY_URL
-                },
-                status_code=502
-            )
+    # 2) Fallback to local model (if present)
+    try:
+        out = _predict_pil_local(pil)
+        LAST["vision"] = {"predictions": out}
+        LAST["vision_updated"] = datetime.utcnow().isoformat()
+        return JSONResponse(out)
+    except Exception as e:
+        return JSONResponse({"error": "inference_failed", "detail": str(e)}, status_code=500)
 
-        resp.raise_for_status()
-        j = resp.json()
-
-    except requests.exceptions.RequestException as e:
-        # Network or HTTP error
-        return JSONResponse(
-            {"error": "roboflow_request_failed", "detail": str(e), "endpoint": CLASSIFY_URL},
-            status_code=502
-        )
-    except ValueError:
-        # Not JSON
-        return JSONResponse(
-            {"error": "roboflow_non_json", "detail": resp.text[:500], "endpoint": CLASSIFY_URL},
-            status_code=502
-        )
-
-    LAST["vision"] = j
-    LAST["vision_updated"] = datetime.utcnow().isoformat()
-    return JSONResponse(j)
-
-
-#Gas model
+# ---------- Gas model ----------
 class GasReading(BaseModel):
-    # either vrl or adc
     vrl: float | None = None
     adc: int | None = None
-    adc_max: int | None = 4095      # default UNO 10-bit
-    vref: float | None = 3.3        # default UNO 5.0V reference
+    adc_max: int | None = 4095
+    vref: float | None = 3.3
     rl:   float | None = 10000.0
     rs:   float | None = None
     r0:   float | None = None
@@ -194,23 +251,19 @@ def _ppm_from_ratio(ratio: float, a: float, b: float) -> float:
 
 @app.post("/gas")
 def gas(g: GasReading):
-    """
-    Accept gas info from ESP32/UNO (or the manual UI),
-    compute Rs/ratio/ppm, update LAST, and persist to DB.
-    """
     VREF = float(g.vref or 3.3)
     RL   = float(g.rl or 10000.0)
+    used_adc = None
+    used_adc_max = int(g.adc_max or 4095)
 
-    # If only ADC is provided, compute VRL from it.
     if g.vrl is None and g.adc is not None:
-        adc_max = int(g.adc_max or 4095)           # UNO default
-        g.vrl = (float(g.adc) / float(adc_max)) * VREF
+        used_adc = int(g.adc)
+        g.vrl = (float(used_adc) / float(used_adc_max)) * VREF
 
     if g.vrl is None and g.rs is None:
-        return {"error": "Send at least one of: vrl, adc, or rs."}
+        return JSONResponse({"error": "Send at least one of: vrl, adc, or rs."}, status_code=400)
 
-    # Rs from divider if not provided
-    rs = float(g.rs) if g.rs is not None else ((VREF - g.vrl) * RL) / max(0.001, g.vrl)
+    rs = float(g.rs) if g.rs is not None else ((VREF - float(g.vrl)) * RL) / max(0.001, float(g.vrl))
     r0 = float(g.r0) if g.r0 is not None else rs
     ratio = rs / max(1e-6, r0)
 
@@ -225,6 +278,7 @@ def gas(g: GasReading):
             "benzene": round(_ppm_from_ratio(ratio, 76.63,   -2.1680), 1),
             "alcohol": round(_ppm_from_ratio(ratio, 77.255,  -3.18),   1),
         },
+        "raw": {"adc": used_adc, "adc_max": used_adc_max, "vref": VREF, "rl": RL, "r0": r0}
     }
 
     LAST["gas"] = data
@@ -234,7 +288,6 @@ def gas(g: GasReading):
 
 @app.post("/cron/snapshot")
 def cron_snapshot():
-    """Store whatever is in LAST['gas'] right now."""
     if not LAST.get("gas") or not LAST["gas"].get("ppm"):
         return {"ok": False, "error": "No gas reading to snapshot yet."}
     save_reading(LAST["gas"]["ppm"])
@@ -242,34 +295,29 @@ def cron_snapshot():
 
 @app.get("/history")
 def history():
-    """Return last 2 days of gas readings from DB."""
     return {"history": load_history_last_days(days=2)}
 
-#Summary (vision + gas)
+# ---------- Summary (vision + gas) ----------
 def _summarize(last: dict) -> dict:
-    """Compress raw Roboflow JSON + gas into one friendly decision."""
-    pred = extract_top_class(last["vision"])  # <— works for classification
-
-    gas = last["gas"]["ppm"] if last["gas"] else {}
-    co2  = gas.get("co2")
-    nh3  = gas.get("nh3")
-    benz = gas.get("benzene")
-    alco = gas.get("alcohol")
-
-    # Thresholds to tune with real data
+    pred = None
+    v = last.get("vision")
+    if isinstance(v, dict) and "predictions" in v and isinstance(v["predictions"], dict):
+        pred = v["predictions"]
+    gas_ppm = (last.get("gas") or {}).get("ppm", {})
+    gas_raw = (last.get("gas") or {}).get("raw", {})
+    co2  = gas_ppm.get("co2")
+    nh3  = gas_ppm.get("nh3")
+    benz = gas_ppm.get("benzene")
+    alco = gas_ppm.get("alcohol")
     co2_hi = (co2 is not None) and (co2 >= 2000)
     nh3_hi = (nh3 is not None) and (nh3 >= 15)
     voc_hi = (benz or 0) >= 5 or (alco or 0) >= 10
-
-    # Any class name starting with/containing 'rotten' => rotten
-    model_rotten = bool(
-        pred and isinstance(pred.get("label"), str) and ("rotten" in pred["label"].lower())
-    )
+    model_rotten = bool(pred and isinstance(pred.get("label"), str) and ("spoiled" in pred["label"].lower()))
     spoiled = model_rotten or co2_hi or nh3_hi or voc_hi
-
     return {
-        "vision": pred,  # e.g. {"label":"rotten_apple","confidence":91.5}
+        "vision": pred,
         "gas_ppm": {"co2": co2, "nh3": nh3, "benzene": benz, "alcohol": alco},
+        "gas_raw": gas_raw,
         "gas_flags": {"co2_high": co2_hi, "nh3_high": nh3_hi, "voc_high": voc_hi},
         "decision": "SPOILED" if spoiled else "FRESH",
     }
@@ -295,7 +343,11 @@ def export_csv():
 def summary():
     return _summarize(LAST)
 
-#UI
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "time": datetime.utcnow().isoformat()}
+
+# ---------- UI pages ----------
 @app.get("/", response_class=HTMLResponse)
 def welcome():
     return """
@@ -340,9 +392,7 @@ def welcome():
   </div>
 </body>
 </html>
-
     """
-
 @app.get("/app", response_class=HTMLResponse)
 def ui():
     return """
@@ -820,3 +870,4 @@ setInterval(()=>loadChart(true), 60_000);
 </body>
 </html>
     """
+
